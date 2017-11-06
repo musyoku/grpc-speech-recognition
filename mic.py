@@ -1,9 +1,4 @@
-import pyaudio
-import time
-import audioop
-import math
-import sys
-import argparse
+import pyaudio, time, audioop, math, sys, argparse
 from gcloud.credentials import get_credentials
 from google.cloud.speech.v1beta1 import cloud_speech_pb2
 from google.rpc import code_pb2

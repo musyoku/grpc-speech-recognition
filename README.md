@@ -48,3 +48,13 @@ Do you want to configure Google Compute Engine ?と聞かれますが`n`と入�
 ```
 gcloud auth application-default login
 ```
+
+## スピーカー出力の取り込み
+
+`loopback.py`を実行中に以下のコマンドでPulseAudioの設定画面を開きます。
+
+```
+pavucontrol
+```
+
+録音タブに実行中のプログラムが表示されるので、音声を鳴らしながら入力のプルダウンメニューを順に選び、適切なものを選択します。

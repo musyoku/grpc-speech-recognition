@@ -92,9 +92,39 @@ def pyaudio_callback(in_data, frame_count, time_info, status):
 	frames.append(in_data)
 	return (None, pyaudio.paContinue)
 
-def main():
+def run_recognition_loop():
 	global frames
+	global is_recording
 	global should_finish_stream
+
+	silent_frames = []
+
+	while not is_recording:
+		time.sleep(args.frame_seconds // 4)
+
+		if len(frames) > 4:
+			for frame_index in range(4):
+				data = frames[frame_index]
+				rms = audioop.rms(data, 2)
+				decibel = 20 * math.log10(rms) if rms > 0 else 0
+				if decibel < args.silent_decibel:
+					silent_frames.append(frames[0:frame_index+1])
+					del frames[0:frame_index + 1]
+					return
+
+			is_recording = True
+			frames = silent_frames + frames
+
+	with cloud_speech_pb2.beta_create_Speech_stub(make_channel(args.host, args.ssl_port)) as service:
+		try:
+			listen_loop(service.StreamingRecognize(request_stream(), args.deadline_seconds))
+			printr(" ".join((bold(recognition_result.transcription), "	", "confidence: ", str(int(recognition_result.confidence * 100)), "%")))
+			print()
+		except Exception as e:
+			print(str(e))
+
+def main():
+	global is_recording
 	global should_finish_stream
 
 	pa = pyaudio.PyAudio()
@@ -120,33 +150,7 @@ def main():
 	while True:
 		is_recording = False
 		should_finish_stream = False
-
-		silent_frames = []
-
-		while not is_recording:
-			time.sleep(args.frame_seconds // 4)
-
-			if len(frames) > 4:
-				for frame_index in range(4):
-					data = frames[frame_index]
-					rms = audioop.rms(data, 2)
-					decibel = 20 * math.log10(rms) if rms > 0 else 0
-
-					if decibel < args.silent_decibel:
-						silent_frames.append(frames[0:frame_index+1])
-						del frames[0:frame_index + 1]
-						break
-
-				is_recording = True
-				frames = silent_frames + frames
-
-		with cloud_speech_pb2.beta_create_Speech_stub(make_channel(args.host, args.ssl_port)) as service:
-			try:
-				listen_loop(service.StreamingRecognize(request_stream(), args.deadline_seconds))
-				printr(" ".join((bold(recognition_result.transcription), "	", "confidence: ", str(int(recognition_result.confidence * 100)), "%")))
-				print()
-			except Exception as e:
-				print(str(e))
+		run_recognition_loop()
 
 	stream.stop_stream()
 	stream.close()

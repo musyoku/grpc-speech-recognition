@@ -1,190 +1,236 @@
-#!/usr/bin/env python
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+# ベースのソースは以下のものです
+# https://github.com/GoogleCloudPlatform/python-docs-samples/blob/master/speech/grpc/transcribe_streaming.py
 
-# Copyright 2017 Google Inc. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""Google Cloud Speech API sample application using the streaming API.
-
-NOTE: This module requires the additional dependency `pyaudio`. To install
-using pip:
-
-    pip install pyaudio
-
-Example usage:
-    python transcribe_streaming_mic.py
-"""
-
-# [START import_libraries]
-from __future__ import division
-
-import re
+import pyaudio
+import time
+import wave
+import audioop
+import math
 import sys
 
-from google.cloud import speech
-from google.cloud.speech import enums
-from google.cloud.speech import types
-import pyaudio
-from six.moves import queue
-# [END import_libraries]
+import re
 
-# Audio recording parameters
-RATE = 16000
-CHUNK = int(RATE / 10)  # 100ms
+from gcloud.credentials import get_credentials
+from google.cloud.speech.v1beta1 import cloud_speech_pb2 as cloud_speech
+from google.rpc import code_pb2
+from grpc.beta import implementations
 
+# 各種設定　#########################
+flag_recogRepeat = True  # 音声認識を繰り返し行う場合　Trueにする
+EXIT_WORD = u"(音声認識を終了します|ちちんぷいぷい|さようなら)"  # 音声認識を終了させる合言葉
+LANG_CODE = 'ja-JP'  # a BCP-47 language tag
 
-class MicrophoneStream(object):
-    """Opens a recording stream as a generator yielding the audio chunks."""
-    def __init__(self, rate, chunk):
-        self._rate = rate
-        self._chunk = chunk
+RATE = 16000  # サンプリングレート
+CHANNELS = 1  # 録音チャンネル数
 
-        # Create a thread-safe buffer of audio data
-        self._buff = queue.Queue()
-        self.closed = True
+RECORD_SEC = 5  # 録音時間(sec)
+DEV_INDEX = 5  # デバイスを指定
 
-    def __enter__(self):
-        self._audio_interface = pyaudio.PyAudio()
-        self._audio_stream = self._audio_interface.open(
-            format=pyaudio.paInt16,
-            # The API currently only supports 1-channel (mono) audio
-            # https://goo.gl/z757pE
-            channels=1, rate=self._rate,
-            input=True, frames_per_buffer=self._chunk,
-            # Run the audio stream asynchronously to fill the buffer object.
-            # This is necessary so that the input device's buffer doesn't
-            # overflow while the calling thread makes network requests, etc.
-            stream_callback=self._fill_buffer,
-        )
+FRAME_SEC = 0.1  # 1フレームの時間（秒）　（0.1sec = 100ms）
+CHUNK = int(RATE * FRAME_SEC)  # 1フレーム内のサンプルデータ数
 
-        self.closed = False
+SLEEP_SEC = FRAME_SEC / 4  # メインループ内でのスリープタイム（秒）
+BUF_SIZE = CHUNK * 2  # 音声のバッファ・サイズ（byte）
 
-        return self
+DECIBEL_THRESHOLD = 10  # 録音開始のための閾値（dB)
+START_FRAME_LEN = 4  # 録音開始のために，何フレーム連続で閾値を超えたらいいか
+START_BUF_LEN = 5  # 録音データに加える，閾値を超える前のフレーム数　（START_FRAME_LENの設定によって，促音の前の音が録音されない問題への対処用）
 
-    def __exit__(self, type, value, traceback):
-        self._audio_stream.stop_stream()
-        self._audio_stream.close()
-        self.closed = True
-        # Signal the generator to terminate so that the client's
-        # streaming_recognize method will not block the process termination.
-        self._buff.put(None)
-        self._audio_interface.terminate()
+# Google のサンプルプログラムより (Keep the request alive for this many seconds)
+DEADLINE_SECS = 8 * 60 * 60
+SPEECH_SCOPE = 'https://www.googleapis.com/auth/cloud-platform'
 
-    def _fill_buffer(self, in_data, frame_count, time_info, status_flags):
-        """Continuously collect data from the audio stream, into the buffer."""
-        self._buff.put(in_data)
-        return None, pyaudio.paContinue
+# バッファ用変数 #####################
+frames = []
+frames_startbuf = []
 
-    def generator(self):
-        while not self.closed:
-            # Use a blocking get() to ensure there's at least one chunk of
-            # data, and stop iteration if the chunk is None, indicating the
-            # end of the audio stream.
-            chunk = self._buff.get()
-            if chunk is None:
-                return
-            data = [chunk]
+flag_RecordStart = False  # 音量が規定フレーム分，閾値を超え続けたらTRUE
+flag_RecogEnd = False  # 音声認識が終わったらTrueにする
 
-            # Now consume whatever other data's still buffered.
-            while True:
-                try:
-                    chunk = self._buff.get(block=False)
-                    if chunk is None:
-                        return
-                    data.append(chunk)
-                except queue.Empty:
-                    break
+recog_result = ""  # 音声認識結果
+SSL_PORT = 443
 
-            yield b''.join(data)
-# [END audio_stream]
+# コールバック関数 ###################
+def callback(in_data, frame_count, time_info, status):
+	frames.append(in_data)
+	return (None, pyaudio.paContinue)
 
 
-def listen_print_loop(responses):
-    """Iterates through server responses and prints them.
+# Creates an SSL channel ###########
+def make_channel(host, port):
+	ssl_channel = implementations.ssl_channel_credentials(None, None, None)
+	creds = get_credentials().create_scoped(SPEECH_SCOPE)
+	auth_header = (
+		'authorization',
+		'Bearer ' + creds.get_access_token().access_token)
+	auth_plugin = implementations.metadata_call_credentials(
+		lambda _, callback: callback([auth_header], None),
+		name='google_creds')
 
-    The responses passed is a generator that will block until a response
-    is provided by the server.
+	composite_channel = implementations.composite_channel_credentials(
+		ssl_channel, auth_plugin)
 
-    Each response may contain multiple results, and each result may contain
-    multiple alternatives; for details, see https://goo.gl/tjCPAU.  Here we
-    print only the transcription for the top alternative of the top result.
-
-    In this case, responses are provided for interim results as well. If the
-    response is an interim one, print a line feed at the end of it, to allow
-    the next result to overwrite it, until the response is a final one. For the
-    final one, print a newline to preserve the finalized transcription.
-    """
-    num_chars_printed = 0
-    for response in responses:
-        if not response.results:
-            continue
-
-        # The `results` list is consecutive. For streaming, we only care about
-        # the first result being considered, since once it's `is_final`, it
-        # moves on to considering the next utterance.
-        result = response.results[0]
-        if not result.alternatives:
-            continue
-
-        # Display the transcription of the top alternative.
-        transcript = result.alternatives[0].transcript
-
-        # Display interim results, but with a carriage return at the end of the
-        # line, so subsequent lines will overwrite them.
-        #
-        # If the previous result was longer than this one, we need to print
-        # some extra spaces to overwrite the previous result
-        overwrite_chars = ' ' * (num_chars_printed - len(transcript))
-
-        if not result.is_final:
-            sys.stdout.write(transcript + overwrite_chars + '\r')
-            sys.stdout.flush()
-
-            num_chars_printed = len(transcript)
-
-        else:
-            print(transcript + overwrite_chars)
-
-            # Exit recognition if any of the transcribed phrases could be
-            # one of our keywords.
-            if re.search(r'\b(exit|quit)\b', transcript, re.I):
-                print('Exiting..')
-                break
-
-            num_chars_printed = 0
+	return implementations.secure_channel(host, port, composite_channel)
 
 
-def main():
-    # See http://g.co/cloud/speech/docs/languages
-    # for a list of supported languages.
-    language_code = 'ja-JP'  # a BCP-47 language tag
+# listen print(loop ##################)
+def listen_print_loop(recognize_stream):
+	global flag_RecogEnd
+	global recog_result
+	for resp in recognize_stream:
+		if resp.error.code != code_pb2.OK:
+			raise RuntimeError('Server error: ' + resp.error.message)
 
-    client = speech.SpeechClient()
-    config = types.RecognitionConfig(
-        encoding=enums.RecognitionConfig.AudioEncoding.LINEAR16,
-        sample_rate_hertz=RATE,
-        language_code=language_code)
-    streaming_config = types.StreamingRecognitionConfig(config=config, interim_results=True)
+		# 音声認識結果＆途中結果の表示 (受け取るデータの詳細は以下を参照のこと)
+		# https://cloud.google.com/speech/reference/rpc/google.cloud.speech.v1beta1#google.cloud.speech.v1beta1.SpeechRecognitionAlternative
+		for result in resp.results:
+			if result.is_final:
+				print("is_final: " + str(result.is_final))
 
-    with MicrophoneStream(RATE, CHUNK) as stream:
-        audio_generator = stream.generator()
-        requests = (types.StreamingRecognizeRequest(audio_content=content)
-                    for content in audio_generator)
+			for alt in result.alternatives:
+				print("conf:" + str(alt.confidence) + " stab:" + str(result.stability))
+				print("trans:" + alt.transcript)
+				recog_result = alt.transcript
 
-        responses = client.streaming_recognize(streaming_config, requests)
+			# 音声認識終了（is_final: True）
+			if result.is_final:
+				flag_RecogEnd = True
+				return
 
-        # Now, put the transcription responses to use.
-        listen_print_loop(responses)
 
+# request stream ####################
+def request_stream(channels=CHANNELS, rate=RATE, chunk=CHUNK):
+	global flag_RecogEnd
+	global LANG_CODE
+	recognition_config = cloud_speech.RecognitionConfig(
+		encoding='LINEAR16',  # raw 16-bit signed LE samples
+		sample_rate=rate,  # the rate in hertz
+		language_code=LANG_CODE,  # a BCP-47 language tag
+	)
+	streaming_config = cloud_speech.StreamingRecognitionConfig(
+		config=recognition_config,
+		interim_results=True, single_utterance=True
+	)
+
+	yield cloud_speech.StreamingRecognizeRequest(streaming_config=streaming_config)
+
+	while True:
+		time.sleep(SLEEP_SEC)
+
+		if flag_RecogEnd:
+			return
+
+		# バッファにデータが溜まったら，データ送信
+		if len(frames) > 0:
+			data_1frame = frames.pop(0)
+			if isinstance(data_1frame, list):
+				data_1frame = b"".join(data_1frame)
+			# data_l2s = b"".join(map(str, data_1frame))
+			# wf.writeframes(data_l2s)  # waveファイルに書き込み
+			yield cloud_speech.StreamingRecognizeRequest(audio_content=data_1frame)  # google ASR
+
+
+# main ##############################
 if __name__ == '__main__':
-    main()
+	print('Start Rec!')
+
+	# pyaudioオブジェクトを作成 --------------------
+	p = pyaudio.PyAudio()
+		
+	p = pyaudio.PyAudio()
+	count = p.get_device_count()
+	devices = []
+	for i in range(count):
+		devices.append(p.get_device_info_by_index(i))
+
+	for i, dev in enumerate(devices):
+		print (i, dev['name'])
+
+	# ストリームを開始 (録音は別スレッドで行われる) ----
+	stream = p.open(format=p.get_format_from_width(2),
+					channels=CHANNELS,
+					rate=RATE,
+					input_device_index=DEV_INDEX,
+					input=True,
+					output=False,
+					frames_per_buffer=CHUNK,
+					stream_callback=callback)
+
+	stream.start_stream()
+
+	# 録音用waveファイルのFileStream作成 ------------
+	wf = wave.open("wave_buf_write.wav", 'wb')
+	wf.setnchannels(CHANNELS)
+	wf.setsampwidth(p.get_sample_size(pyaudio.paInt16))
+	wf.setframerate(RATE)
+
+	while True:
+		# フラグ初期化 ##################################
+		flag_RecordStart = False  # 音量が規定フレーム分，閾値を超え続けたらTRUE
+		flag_RecogEnd = False  # 音声認識が終わったらTrueにする
+
+		# 録音開始までの処理 ##############################
+		while not flag_RecordStart:
+			time.sleep(SLEEP_SEC)
+
+			# 促音用バッファが長過ぎたら捨てる（STARTフレームより更に前のデータを保存しているバッファ）
+			if len(frames_startbuf) > START_BUF_LEN:
+				del frames_startbuf[0:len(frames_startbuf) - START_BUF_LEN]
+
+			# バッファにデータが溜まったら，録音開始するべきか判定 ---------
+			if len(frames) > START_FRAME_LEN:
+				# 1フレーム内の音量計算--------------------------------
+				for i in range(START_FRAME_LEN):
+					data = frames[i]
+					rms = audioop.rms(data, 2)
+					decibel = 20 * math.log10(rms) if rms > 0 else 0
+					sys.stdout.write("\rrms %3d decibel %f" %(rms,decibel))
+					sys.stdout.flush()
+
+					# 音量が閾値より小さかったら，データを捨てループを抜ける ----
+					if decibel < DECIBEL_THRESHOLD:
+						frames_startbuf.append(frames[0:i + 1])
+						del frames[0:i + 1]
+						break
+
+					# 全フレームの音量が閾値を超えていたら，録音開始！！ ----
+					# 更に，framesの先頭に，先頭バッファをプラス
+					# これをしないと「かっぱ」の「かっ」など，促音の前の音が消えてしまう
+					if i == START_FRAME_LEN - 1:
+						flag_RecordStart = True
+						frames = frames_startbuf + frames
+
+		# googleサーバに接続 ############################
+		print("\nconnecting ....")
+		with cloud_speech.beta_create_Speech_stub(
+				make_channel('speech.googleapis.com', SSL_PORT)) as service:
+			try:
+				print("success to connect.")
+			except:
+				print("connection error.")
+
+		# 録音開始後の処理 ###############################
+		listen_print_loop(
+			service.StreamingRecognize(
+				request_stream(), DEADLINE_SECS))
+
+		# 音声認識 繰り返しの終了判定 #####################
+		if re.match(EXIT_WORD, recog_result):
+			print('Exiting..')
+			break
+
+		# 音声認識繰り返ししない設定 ######################
+		if not flag_recogRepeat:
+			break
+
+	# ストリームを止めて，クローズ
+	print('Closing audio stream....')
+	stream.stop_stream()
+	stream.close()
+
+	p.terminate()  # pyaudioオブジェクトを終了
+	wf.close()  # wavefile stream クローズ
+
+	print('End Rec!')

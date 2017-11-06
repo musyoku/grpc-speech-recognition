@@ -1,4 +1,6 @@
-import pyaudio, time, audioop, math, sys, argparse
+import time, math, sys, argparse
+import pyaudio, alsaaudio, audioop
+from multiprocessing import Process, Queue
 from gcloud.credentials import get_credentials
 from google.cloud.speech.v1beta1 import cloud_speech_pb2
 from google.rpc import code_pb2
@@ -17,8 +19,8 @@ def printr(string):
 	sys.stdout.write(string)
 	sys.stdout.flush()
 
+queue = Queue()
 frames = []
-is_recording = False
 should_finish_stream = False
 
 class Result:
@@ -26,8 +28,21 @@ class Result:
 		self.transcription = ""
 		self.confidence = ""
 		self.is_final = False
+		self.success = False
 
 recognition_result = Result()
+
+def reading_audio_loop(queue):
+	recorder = alsaaudio.PCM(alsaaudio.PCM_CAPTURE, alsaaudio.PCM_NONBLOCK, device="pulse")
+	recorder.setchannels(1)
+	recorder.setrate(args.sampling_rate)
+	recorder.setformat(alsaaudio.PCM_FORMAT_S16_LE)
+	recorder.setperiodsize(1024)
+
+	while True:
+		length, data = recorder.read()
+		if length > 0:
+			queue.put(data)
 
 def make_channel(host, port):
 	ssl_channel = implementations.ssl_channel_credentials(None, None, None)
@@ -54,10 +69,15 @@ def listen_loop(recognize_stream):
 
 			if result.is_final:
 				recognition_result.is_final = True
+				recognition_result.success = True
 				should_finish_stream = True
 				return
 
 def request_stream():
+	global queue
+	global recognition_result
+	global should_finish_stream
+
 	recognition_config = cloud_speech_pb2.RecognitionConfig(
 		encoding=args.audio_encoding,
 		sample_rate=args.sampling_rate,
@@ -72,95 +92,52 @@ def request_stream():
 
 	yield cloud_speech_pb2.StreamingRecognizeRequest(streaming_config=streaming_config)
 
-	while True:
-		time.sleep(args.frame_seconds / 4)
+	frame_length = int(args.sampling_rate * args.frame_seconds)
+	frame = b""
 
+	while True:
 		if should_finish_stream:
 			return
 
-		if len(frames) > 0:
-			yield cloud_speech_pb2.StreamingRecognizeRequest(audio_content=frames.pop(0))
-
-def pyaudio_callback(in_data, frame_count, time_info, status):
-	# in_data = b"".join(in_data)
-	assert isinstance(in_data, bytes)
-	frames.append(in_data)
-	return (None, pyaudio.paContinue)
-
-def run_recognition_loop():
-	global frames
-	global is_recording
-	global should_finish_stream
-
-	silent_frames = []
-
-	while not is_recording:
-		time.sleep(args.frame_seconds // 4)
-
-		if len(frames) > 4:
-			for frame_index in range(4):
-				data = frames[frame_index]
-				rms = audioop.rms(data, 2)
+		try:
+			data = queue.get(False)
+			frame += data
+		except Exception as e:
+			if len(frame) > frame_length:
+				rms = audioop.rms(frame, 2)
 				decibel = 20 * math.log10(rms) if rms > 0 else 0
 				if decibel < args.silent_decibel:
-					silent_frames.append(frames[0:frame_index+1])
-					del frames[0:frame_index + 1]
+					recognition_result.success = False
 					return
-
-			is_recording = True
-			frames = silent_frames + frames
-
-	with cloud_speech_pb2.beta_create_Speech_stub(make_channel(args.host, args.ssl_port)) as service:
-		try:
-			listen_loop(service.StreamingRecognize(request_stream(), args.deadline_seconds))
-			printr(" ".join((bold(recognition_result.transcription), "	", "confidence: ", str(int(recognition_result.confidence * 100)), "%")))
-			print()
-		except Exception as e:
-			print(str(e))
+				yield cloud_speech_pb2.StreamingRecognizeRequest(audio_content=frame)
+				frame = b""
+			time.sleep(args.frame_seconds / 4)
 
 def main():
-	global is_recording
+	global queue
 	global should_finish_stream
 
-	pa = pyaudio.PyAudio()
-	count = pa.get_device_count()
-	devices = []
-	for i in range(count):
-		devices.append(pa.get_device_info_by_index(i))
-
-	for device_index, metadata in enumerate(devices):
-		print(device_index, metadata["name"])
-
-	stream = pa.open(format=pa.get_format_from_width(2),
-					channels=1,
-					rate=args.sampling_rate,
-					input_device_index=args.device_index,
-					input=True,
-					output=False,
-					frames_per_buffer=int(args.sampling_rate * args.frame_seconds),
-					stream_callback=pyaudio_callback)
-
-	stream.start_stream()
+	preloading_process = Process(target=reading_audio_loop, args=[queue])
+	preloading_process.start()
 
 	while True:
-		is_recording = False
 		should_finish_stream = False
-		run_recognition_loop()
 
-	stream.stop_stream()
-	stream.close()
+		with cloud_speech_pb2.beta_create_Speech_stub(make_channel(args.host, args.ssl_port)) as service:
+			listen_loop(service.StreamingRecognize(request_stream(), args.deadline_seconds))
+			if recognition_result.success:
+				printr(" ".join((bold(recognition_result.transcription), "	", "confidence: ", str(int(recognition_result.confidence * 100)), "%")))
+				print()
 
-	pa.terminate()
 
 if __name__ == "__main__":
 	parser = argparse.ArgumentParser()
 	parser.add_argument("--sampling-rate", "-rate", type=int, default=16000)
-	parser.add_argument("--device-index", "-device", type=int, default=0)
 	parser.add_argument("--lang-code", "-lang", type=str, default="ja-JP")
 	parser.add_argument("--audio-encoding", "-encode", type=str, default="LINEAR16")
 	parser.add_argument("--frame-seconds", "-fsec", type=float, default=0.1, help="1フレームあたりの時間（秒）. デフォルトは100ミリ秒")
 	parser.add_argument("--deadline-seconds", "-dsec", type=int, default=60*3+5)
-	parser.add_argument("--silent-decibel", "-decibel", type=int, default=40)
+	parser.add_argument("--silent-decibel", "-decibel", type=int, default=20)
 	parser.add_argument("--speech-scope", "-scope", type=str, default="https://www.googleapis.com/auth/cloud-platform")
 	parser.add_argument("--ssl-port", "-port", type=int, default=443)
 	parser.add_argument("--host", "-host", type=str, default="speech.googleapis.com")

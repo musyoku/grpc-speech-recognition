@@ -18,6 +18,7 @@ def printr(string):
 	sys.stdout.flush()
 
 frames = []
+silent_frames = []
 is_recording = False
 should_finish_stream = False
 
@@ -89,10 +90,9 @@ def pyaudio_callback(in_data, frame_count, time_info, status):
 
 def run_recognition_loop():
 	global frames
+	global silent_frames
 	global is_recording
 	global should_finish_stream
-
-	silent_frames = []
 
 	while not is_recording:
 		time.sleep(args.frame_seconds // 4)
@@ -109,6 +109,7 @@ def run_recognition_loop():
 
 			is_recording = True
 			frames = silent_frames + frames
+			silent_frames = []
 
 	with cloud_speech_pb2.beta_create_Speech_stub(make_channel(args.host, args.ssl_port)) as service:
 		try:

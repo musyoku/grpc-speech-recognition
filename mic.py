@@ -93,6 +93,9 @@ def run_recognition_loop():
 	global silent_frames
 	global is_recording
 	global should_finish_stream
+	
+	if len(silent_frames) > 4:
+		silent_frames = silent_frames[-4:]
 
 	while not is_recording:
 		time.sleep(args.frame_seconds // 4)
@@ -103,7 +106,7 @@ def run_recognition_loop():
 				rms = audioop.rms(data, 2)
 				decibel = 20 * math.log10(rms) if rms > 0 else 0
 				if decibel < args.silent_decibel:
-					silent_frames.append(frames[0:frame_index+1])
+					silent_frames += frames[0:frame_index+1]
 					del frames[0:frame_index + 1]
 					return
 
@@ -124,12 +127,9 @@ def main():
 	global should_finish_stream
 
 	pa = pyaudio.PyAudio()
-	count = pa.get_device_count()
 	devices = []
-	for i in range(count):
-		devices.append(pa.get_device_info_by_index(i))
-
-	for device_index, metadata in enumerate(devices):
+	for device_index in range(pa.get_device_count()):
+		metadata = pa.get_device_info_by_index(device_index)
 		print(device_index, metadata["name"])
 
 	stream = pa.open(format=pa.get_format_from_width(2),
